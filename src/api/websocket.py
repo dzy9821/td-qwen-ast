@@ -88,7 +88,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         # 回复握手成功
         await _send_response(websocket, session, status=0, seg_id=0)
         session.set_streaming()
-        logger.info("Handshake OK: sid=%s, biz_id=%s", session.sid, session.biz_id)
+        logger.info("Connection opened: sid=%s, trace=%s, biz_id=%s", session.sid, session.trace_id, session.biz_id)
 
         # ---- 流式处理循环 ----
         while True:
@@ -99,11 +99,23 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 await _handle_audio_frame(websocket, session, msg)
 
             elif msg.header.status == 2:
+                logger.info(
+                    "Client initiated graceful close: sid=%s, trace=%s, segs=%d",
+                    session.sid,
+                    session.trace_id,
+                    session.seg_id,
+                )
                 await _handle_end_frame(websocket, session)
                 await _wait_for_client_disconnect(websocket, session)
 
     except WebSocketDisconnect:
-        logger.info("Client disconnected: sid=%s", session.sid if session else "?")
+        logger.info(
+            "Client disconnected (wire close): sid=%s, trace=%s, biz_id=%s, segs=%d",
+            session.sid if session else "?",
+            session.trace_id if session else "?",
+            session.biz_id if session else "?",
+            session.seg_id if session else 0,
+        )
     except asyncio.TimeoutError:
         logger.warning("Handshake timeout")
         asr_errors_total.labels(error_type="handshake_timeout").inc()
@@ -237,8 +249,9 @@ async def _wait_for_client_disconnect(
 ) -> None:
     """最终响应发出后保持连接打开，等待客户端主动关闭。"""
     logger.info(
-        "Waiting for client close: sid=%s",
+        "Waiting for client close: sid=%s, trace=%s",
         session.sid if session else "?",
+        session.trace_id if session else "?",
     )
     while True:
         await websocket.receive_text()
@@ -252,7 +265,12 @@ async def _wait_for_client_disconnect_safely(
     try:
         await _wait_for_client_disconnect(websocket, session)
     except (WebSocketDisconnect, RuntimeError):
-        logger.info("Client disconnected: sid=%s", session.sid if session else "?")
+        logger.info(
+            "Client disconnected (wire close): sid=%s, trace=%s, biz_id=%s",
+            session.sid if session else "?",
+            session.trace_id if session else "?",
+            session.biz_id if session else "?",
+        )
 
 
 async def _process_segment(
@@ -344,10 +362,12 @@ async def _process_segment(
         asr_processing_latency_ms.observe(total_ms)
         asr_segments_total.inc()
 
+        audio_ms = len(audio_int16) / 16.0
         logger.info(
-            "Segment processed: seg_id=%d, text=%s, asr=%.0fms, total=%.0fms",
+            "Segment processed: seg_id=%d, text=%s, audio=%.0fms, asr=%.0fms, total=%.0fms",
             seg_id,
             final_text,
+            audio_ms,
             asr_ms,
             total_ms,
         )
