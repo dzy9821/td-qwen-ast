@@ -75,6 +75,8 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         # ---- 握手阶段（带超时） ----
         session = await _handle_handshake(websocket)
         if session is None:
+            connection_manager.release_slot()
+            connection_slot_released = True
             await _wait_for_client_disconnect(websocket)
             return
 
@@ -110,7 +112,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         logger.exception("Unexpected error: %s", exc)
         asr_errors_total.labels(error_type="internal").inc()
         try:
-            await _send_error(websocket, session, str(exc))
+            await _send_error(websocket, session, str(exc), status=2)
         except Exception:
             pass
         await _wait_for_client_disconnect_safely(websocket, session)
@@ -413,15 +415,16 @@ async def _send_error(
     websocket: WebSocket,
     session: ASRSession | None,
     detail: str,
+    status: int = 1,
 ) -> None:
-    """推送错误消息。"""
+    """推送错误消息。status 默认为 1（segment 级错误），主循环异常时传 2（会话终结）。"""
     error_resp = {
         "header": {
             "code": -1,
             "message": detail,
             "sid": session.sid if session else "",
             "traceId": session.trace_id if session else "",
-            "status": 2,
+            "status": status,
         },
     }
     await websocket.send_text(json.dumps(error_resp, ensure_ascii=False))
