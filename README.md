@@ -41,8 +41,8 @@
    - **动态转写触发规则**：停顿等待时间随已收集语音长度线性缩短，具体逻辑如下：
      - **短音频抑制**：语音时长 `< 0.5s`，视为噪声或误触，不触发（继续等待）。
      - **长音频强制触发**：语音时长 `>= 30.0s`，无论停顿多久立即触发，防止缓冲区堆积（即转发给 ASR 的语音最长为 30 秒）。
-     - **动态停顿阈值（0\~20s）**：累积语音 `0s` 时需停顿 `1.0s (T_MAX)` 方可触发；累积至 `20s` 时仅需 `0.5s (T_MIN)`，两者之间线性递减（斜率 `K = 0.025`）。语音越长，触发断句需要的停顿越短。
-     - **固定停顿阈值（20\~30s）**：累积语音 `>= 20s` 后，停顿 `0.5s` 即触发转发。
+     - **动态停顿阈值（0~20s）**：累积语音 `0s` 时需停顿 `0.7s (T_MAX)` 方可触发；累积至 `20s` 时仅需 `0.35s (T_MIN)`，两者之间线性递减（斜率 `K = 0.0175`）。语音越长，触发断句需要的停顿越短。
+     - **固定停顿阈值（20~30s）**：累积语音 `>= 20s` 后，停顿 `0.35s` 即触发转发。
 4. **语音识别（异步后台）**：VAD 触发断句后，截取的语音片段（含前后各 N 帧真实音频作为上下文，帧数由 `ASR_PAD_FRAMES` 控制）通过 `asyncio.create_task()` 在**后台异步**发送至 vLLM 服务（OpenAI 兼容接口），由 Qwen3-ASR-1.7B 模型完成转写。**ASR 推理不阻塞音频帧的持续接收**，多个 VAD 分段可以同时进行 ASR 推理。热词通过拼接提示词（Prompt）的方式注入，以提升特定词汇识别准确率。
 5. **文本后处理**：ASR 原始输出经 ITN 模型处理，转换为标准化文本（如数字、符号规范化）。ITN 请求通过 8 实例多进程池自动负载均衡分流。
 6. **结果推送**：后台 ASR 任务完成后，将结果存入**会话缓冲队列**（`result_buffer`）。服务端会严格按照 `segId` 递增顺序检查队列并推送结果。**这彻底解决了并发带来的乱序问题**，确保客户端收到的文本始终按照真实说话的时间顺序到达，同时通过 `send_lock` 互斥锁安全地进行 WebSocket 写入。常规 VAD 断句以 `status=1` 推送；flush 残余语音段（客户端发送 `status=2` 触发）的识别文本与终态 `status=2` 捆绑在同一帧中发送。
@@ -54,11 +54,11 @@
 1. **握手与推流开始**：客户端发送 `status: 0` 帧建立连接。随后开始以 40ms 间隔持续推送音频流帧（`status: 1`）。
 2. **第一段（"你好"） —— 正常停顿触发**：
    - **输入**：用户说了 1s 的"你好"，然后思考停顿了 1.0s。
-   - **VAD 判定**：当前收集语音长 1s，根据公式计算动态停顿阈值约为 `1.0 - 0.025*1 = 0.975s`。实际停顿 1.0s `>` 0.975s，**成功触发第一次断句**。
+   - **VAD 判定**：当前收集语音长 1s，根据公式计算动态停顿阈值约为 `0.7 - 0.0175*1 = 0.6825s`。实际停顿 1.0s `>` 0.6825s，**成功触发第一次断句**。
    - **异步 ASR**：服务端通过 `asyncio.create_task()` 在**后台启动 ASR 任务**，截取这 1s 的音频封装成 HTTP 请求发给 vLLM。**主循环不等待 ASR 完成，继续接收后续音频帧**。ASR 完成后，通过 `send_lock` 安全地将"你好"推送给客户端（附带 `segId: 0` 和识别中状态 `status: 1`）。VAD 缓冲区清空并重新开始收集。
 3. **第二段（"帮我查一下今天的天气"） —— 动态缩短阈值触发**：
    - **输入**：用户说了 6s（语速较慢），然后轻微停顿了 0.9s。
-   - **VAD 判定**：当前语音长 6s，动态停顿阈值随之降低，约为 `1.0 - 0.025*6 = 0.85s`。实际停顿 0.9s `>` 0.85s，**成功触发第二次断句**。
+   - **VAD 判定**：当前语音长 6s，动态停顿阈值随之降低，约为 `0.7 - 0.0175*6 = 0.595s`。实际停顿 0.9s `>` 0.595s，**成功触发第二次断句**。
    - **异步 ASR**：同样在后台启动 ASR 任务。此时第一段的 ASR 可能仍在进行中，两段 ASR 可以**并行推理**。推送结果"帮我查一下今天的天气"（附带 `segId: 1` 和识别中状态 `status: 1`）。VAD 缓冲区再次清空。
 4. **第三段（"特别是下午会不会下雨"） —— 客户端主动结束触发**：
    - **输入**：用户最后说了 3s 的内容。说完后，用户立刻松开语音按钮或关闭麦克风，客户端发送结束帧（`status: 2`）。
@@ -183,7 +183,7 @@
 | 类别 | 工具链 | 用途 |
 | :--- | :--- | :--- |
 | **测试** | pytest, pytest-asyncio, pytest-cov | 异步单元测试与覆盖率统计。 |
-| **代码规范** | Ruff, Black, MyPy | 静态检查、格式化与类型校验。 |
+| **代码规范** | Ruff, MyPy | 静态检查、格式化与类型校验。 |
 
 ---
 
@@ -202,16 +202,25 @@
 | `WS_PING_INTERVAL` | 5 | WebSocket 心跳（Ping）发送间隔（秒）。 |
 | `WS_PING_TIMEOUT` | 20 | WebSocket 心跳超时时间（秒）。 |
 | `MP_QUEUE_LOG_INTERVAL_SEC` | 10 | ITN 多进程池队列深度监控日志打印间隔（秒）。 |
-| `VLLM_API_BASE` | http://148.148.52.127:15002/v1 | vLLM 服务的 OpenAI 兼容 API 地址。 |
+| `VLLM_API_BASE` | http://127.0.0.1:15002/v1 | vLLM 服务的 OpenAI 兼容 API 地址。 |
 | `VLLM_MODEL_NAME` | Qwen3-ASR-1.7B | vLLM 中加载的 ASR 模型名称。 |
 | `VLLM_API_KEY` | EMPTY | vLLM API 密钥（默认无鉴权）。 |
+| `VLLM_MODEL_PATH` | /weights/Qwen3-ASR-1.7B | vLLM 加载的 ASR 模型权重路径。 |
+| `VLLM_PORT` | 15002 | vLLM 推理服务监听端口。 |
+| `VLLM_TENSOR_PARALLEL_SIZE` | 1 | vLLM 张量并行数。 |
+| `VLLM_MAX_MODEL_LEN` | 32768 | vLLM 最大模型上下文长度。 |
+| `VLLM_GPU_MEMORY_UTILIZATION` | 0.6 | vLLM GPU 显存利用率 [0.0, 1.0]。 |
+| `VLLM_EXTRA_ARGS` | （空） | vLLM 启动时附加的命令行参数。 |
+| `VLLM_STARTUP_TIMEOUT` | 3000 | vLLM 启动超时时间（秒）。 |
+| `VLLM_HEALTH_CHECK_INTERVAL` | 5 | vLLM 健康检查间隔（秒）。连续 3 次失败触发优雅关闭。 |
 | `ASCEND_RT_VISIBLE_DEVICES` | 0 | 本服务可见的 Ascend NPU 设备 ID（由 vLLM-Ascend 使用）。 |
 | `HOTWORDS` | （空） | 服务端默认热词列表，逗号分隔（如 `张三丰,武当山,太极拳`）。客户端传入的热词会追加合并。 |
 | `LOG_LEVEL` | INFO | 日志输出级别（DEBUG 用于排查）。 |
+| `ASR_PAD_FRAMES` | 5 | 发给 ASR 时首尾各附加的真实音频上下文帧数（帧长 = VAD_HOP_SIZE samples），替代静默填充。 |
 | `VAD_HOP_SIZE` | 640 | TEN-VAD 帧长（采样数），16kHz 下 640 = 40ms。 |
-| `VAD_THRESHOLD` | 0.5 | TEN-VAD 语音概率阈值 [0.0, 1.0]，>= 此值判定为语音帧。 |
-| `VAD_PAUSE_MAX` | 1.0 | VAD 动态断句：累积语音 0s 时所需停顿秒数（线性区间上限）。 |
-| `VAD_PAUSE_MIN` | 0.5 | VAD 动态断句：累积语音 ≥ `VAD_DYNAMIC_RANGE_END` 时所需停顿秒数（线性区间下限）。 |
+| `VAD_THRESHOLD` | 0.4 | TEN-VAD 语音概率阈值 [0.0, 1.0]，>= 此值判定为语音帧。 |
+| `VAD_PAUSE_MAX` | 0.7 | VAD 动态断句：累积语音 0s 时所需停顿秒数（线性区间上限）。 |
+| `VAD_PAUSE_MIN` | 0.35 | VAD 动态断句：累积语音 ≥ `VAD_DYNAMIC_RANGE_END` 时所需停顿秒数（线性区间下限）。 |
 | `VAD_DYNAMIC_RANGE_END` | 20.0 | VAD 动态断句：线性递减区间终点（秒），超过此值使用 `VAD_PAUSE_MIN`。 |
 | `VAD_MIN_SPEECH` | 0.5 | VAD 短音频抑制门限（秒），语音不足此值则不转发至 ASR。 |
 | `VAD_MAX_SPEECH` | 30.0 | VAD 长音频强制触发门限（秒），超过此值立即转发至 ASR。 |
@@ -228,7 +237,7 @@
 
 ```bash
 # 依赖安装
-pip install -r requirements.txt
+uv pip install .
 
 # 服务启动
 python main.py
@@ -246,7 +255,7 @@ docker-compose up -d
    pip install 'git+https://github.com/wenet-e2e/WeTextProcessing.git'
    ```
 2. **复制项目代码**：将完整项目（含 `models/`、`src/` 等）COPY 进镜像。TEN-VAD 原生库已包含在 `models/vad/ten-vad/` 目录中。**注意**：`weights/Qwen3-ASR-1.7B/` 目录不 COPY 进镜像，通过 Volume 挂载。
-3. **安装项目依赖**：`pip install -r requirements.txt`（或 `uv sync`）。PyTorch 如已在基础镜像中预装则无需重复安装。
+3. **安装项目依赖**：`uv pip install .`。PyTorch 如已在基础镜像中预装则无需重复安装。
 4. **设置启动命令**：用户手动执行 vLLM 服务与本推理服务的启动命令。
 
 > **注意**：ASR 模型权重（`weights/Qwen3-ASR-1.7B/`）**必须以 Volume 形式挂载**，不打入镜像，以控制镜像体积并方便模型版本更新。
@@ -319,7 +328,7 @@ python main.py
 - [x] WebSocket 全链路处理（`websocket.py`，握手→音频→断句→异步推理→推送）
 - [x] ASR 异步后台处理与**顺序保证**（`session.py` 缓冲队列 `_result_buffer` 解决长短句并发乱序）
 - [x] 并发连接管理（`connection_manager.py`，Semaphore + 1013 拒绝）
-- [x] 会话状态机（`session.py`，sid 生成、seg_id 递增；每 Session 注册至 VAD 批处理器，close() 时注销）
+- [x] 会话状态机（`session.py`，sid 生成、seg_id 递增；每 Session 持有独立 `TenVADSession` 实例，close() 时释放）
 - [x] 健康探针与 Prometheus 指标暴露（`health.py`、`metrics.py`）
 - [x] 虚拟环境与依赖安装（含 WeTextProcessing + PyTorch），本地启动验证通过
 - [x] 端到端联调：连接远程 vLLM ASR，跑通完整管线

@@ -34,10 +34,10 @@ class Settings:
     )
     VLLM_MAX_MODEL_LEN: int = int(os.getenv("VLLM_MAX_MODEL_LEN", "32768"))
     VLLM_GPU_MEMORY_UTILIZATION: float = float(
-        os.getenv("VLLM_GPU_MEMORY_UTILIZATION", "0.9")
+        os.getenv("VLLM_GPU_MEMORY_UTILIZATION", "0.6")
     )
     VLLM_EXTRA_ARGS: str = os.getenv("VLLM_EXTRA_ARGS", "")
-    VLLM_STARTUP_TIMEOUT: int = int(os.getenv("VLLM_STARTUP_TIMEOUT", "300"))
+    VLLM_STARTUP_TIMEOUT: int = int(os.getenv("VLLM_STARTUP_TIMEOUT", "3000"))
     """vLLM 启动超时（秒）。"""
     VLLM_HEALTH_CHECK_INTERVAL: float = float(
         os.getenv("VLLM_HEALTH_CHECK_INTERVAL", "5")
