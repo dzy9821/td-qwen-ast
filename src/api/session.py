@@ -8,6 +8,7 @@ import asyncio
 import enum
 import random
 import string
+import time
 
 from src.core.config import settings
 from src.services.asr_service import build_hotword_context
@@ -71,6 +72,13 @@ class ASRSession:
         self._result_buffer: dict[int, str] = {}
         self._final_result_json: str | None = None  # flush 段暂存，与 status=2 捆绑发送
 
+        # ---- 握手帧携带的首帧音频 ----
+        self._first_audio_payload = None  # type: ignore
+
+        # ---- 音频到达延时诊断 ----
+        self._connection_start_time: float = 0.0  # 流式开始时刻 (time.monotonic)
+        self._accumulated_audio_samples: int = 0  # 累计收到的音频采样数
+
     async def push_result_in_order(self, websocket, seg_id: int, response_json: str) -> None:
         """保证按 seg_id 顺序推送结果，解决短句先于长句返回导致的乱序问题。"""
         async with self._send_lock:
@@ -124,6 +132,7 @@ class ASRSession:
 
     def set_streaming(self) -> None:
         self.state = SessionState.STREAMING
+        self._connection_start_time = time.monotonic()
 
     def get_opus_decoder(self) -> OpusDecoder:
         """获取或延迟创建当前连接的 Opus 解码器。"""

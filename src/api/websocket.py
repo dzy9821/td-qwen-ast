@@ -77,7 +77,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         if session is None:
             connection_manager.release_slot()
             connection_slot_released = True
-            await _wait_for_client_disconnect(websocket)
+            await _close_connection(websocket)
             return
 
         # 注册连接
@@ -88,6 +88,12 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         # 回复握手成功
         await _send_response(websocket, session, status=0, seg_id=0)
         session.set_streaming()
+
+        # 处理握手帧中携带的首帧音频
+        if session._first_audio_payload is not None:
+            await _handle_audio_frame(websocket, session, session._first_audio_payload)
+            session._first_audio_payload = None
+
         logger.info("Connection opened: sid=%s, trace=%s, biz_id=%s", session.sid, session.trace_id, session.biz_id)
 
         # ---- 流式处理循环 ----
@@ -106,7 +112,8 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     session.seg_id,
                 )
                 await _handle_end_frame(websocket, session)
-                await _wait_for_client_disconnect(websocket, session)
+                await _close_connection(websocket, session)
+                break
 
     except WebSocketDisconnect:
         logger.info(
@@ -119,7 +126,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     except asyncio.TimeoutError:
         logger.warning("Handshake timeout")
         asr_errors_total.labels(error_type="handshake_timeout").inc()
-        await _wait_for_client_disconnect_safely(websocket, session)
+        await _close_connection(websocket, session)
     except Exception as exc:
         logger.exception("Unexpected error: %s", exc)
         asr_errors_total.labels(error_type="internal").inc()
@@ -127,7 +134,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             await _send_error(websocket, session, str(exc), status=2)
         except Exception:
             pass
-        await _wait_for_client_disconnect_safely(websocket, session)
+        await _close_connection(websocket, session)
     finally:
         if session:
             session.close()  # 取消后台 ASR 任务 + 从 VAD 批处理器注销
@@ -172,6 +179,10 @@ async def _handle_handshake(websocket: WebSocket) -> ASRSession | None:
             base = build_hotword_context(settings.HOTWORDS)
             session.hotword_context = f"{base}\n{client_ctx}" if base else client_ctx
 
+    # 握手帧可能同时携带首帧音频数据
+    if msg.payload and msg.payload.audio:
+        session._first_audio_payload = msg
+
     return session
 
 
@@ -209,6 +220,20 @@ async def _handle_audio_frame(
     # 喂入 VAD（通过全局批处理器异步推理）
     segments = await session.vad.feed_audio(pcm_int16)
 
+    # 累计音频采样数，用于诊断网络延迟
+    session._accumulated_audio_samples += len(pcm_int16)
+    acc_audio_ms = samples_to_ms(session._accumulated_audio_samples)
+    conn_ms = int((time.monotonic() - session._connection_start_time) * 1000)
+    gap_ms = conn_ms - acc_audio_ms
+    logger.debug(
+        "Audio frame: sid=%s, frame_smps=%d, acc_audio_ms=%d, conn_ms=%d, gap_ms=%d",
+        session.sid,
+        len(pcm_int16),
+        acc_audio_ms,
+        conn_ms,
+        gap_ms,
+    )
+
     # 对每个触发的语音段，启动后台 ASR+ITN 任务（不阻塞音频接收）
     for seg in segments:
         task = asyncio.create_task(
@@ -243,34 +268,15 @@ async def _handle_end_frame(websocket: WebSocket, session: ASRSession) -> None:
             await _send_response(websocket, session, status=2, seg_id=last_seg_id)
 
 
-async def _wait_for_client_disconnect(
+async def _close_connection(
     websocket: WebSocket,
     session: ASRSession | None = None,
 ) -> None:
-    """最终响应发出后保持连接打开，等待客户端主动关闭。"""
-    logger.info(
-        "Waiting for client close: sid=%s, trace=%s",
-        session.sid if session else "?",
-        session.trace_id if session else "?",
-    )
-    while True:
-        await websocket.receive_text()
-
-
-async def _wait_for_client_disconnect_safely(
-    websocket: WebSocket,
-    session: ASRSession | None = None,
-) -> None:
-    """等待客户端关闭；吞掉断开异常，避免覆盖原始处理分支。"""
+    """服务端主动关闭 WebSocket 连接，避免无限等待客户端断开。"""
     try:
-        await _wait_for_client_disconnect(websocket, session)
-    except (WebSocketDisconnect, RuntimeError):
-        logger.info(
-            "Client disconnected (wire close): sid=%s, trace=%s, biz_id=%s",
-            session.sid if session else "?",
-            session.trace_id if session else "?",
-            session.biz_id if session else "?",
-        )
+        await asyncio.wait_for(websocket.close(), timeout=3.0)
+    except Exception:
+        pass
 
 
 async def _process_segment(
@@ -363,11 +369,15 @@ async def _process_segment(
         asr_segments_total.inc()
 
         audio_ms = len(audio_int16) / 16.0
+        conn_ms_at_spawn = int((t0 - session._connection_start_time) * 1000)
         logger.info(
-            "Segment processed: seg_id=%d, text=%s, audio=%.0fms, asr=%.0fms, total=%.0fms",
+            "Segment processed: seg_id=%d, text=%s, audio=%.0fms, pos=[%d-%d]ms, conn=%dms, asr=%.0fms, total=%.0fms",
             seg_id,
             final_text,
             audio_ms,
+            bg_ms,
+            ed_ms,
+            conn_ms_at_spawn,
             asr_ms,
             total_ms,
         )
