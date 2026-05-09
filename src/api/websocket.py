@@ -61,12 +61,24 @@ itn_pool: ITNPool = ITNPool()
 async def websocket_endpoint(websocket: WebSocket) -> None:
     """ASR 实时流式转录 WebSocket 端点。"""
 
+    client_host = websocket.client.host if websocket.client else "unknown"
+    client_port = websocket.client.port if websocket.client else 0
+    logger.info(
+        "New WebSocket connection attempt: client=%s:%s, active_slots=%d/%d",
+        client_host, client_port,
+        connection_manager._active_count, connection_manager._max_connections,
+    )
+
     # ---- 并发控制 ----
     if not connection_manager.try_acquire():
         await websocket.close(code=1013, reason="Try Again Later")
-        logger.warning("Connection rejected: max connections reached")
+        logger.warning(
+            "Connection rejected: max connections reached, client=%s:%s",
+            client_host, client_port,
+        )
         return
 
+    logger.info("Connection slot acquired: client=%s:%s", client_host, client_port)
     await websocket.accept()
     session = None
     connection_slot_released = False
@@ -117,11 +129,12 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
 
     except WebSocketDisconnect:
         logger.info(
-            "Client disconnected (wire close): sid=%s, trace=%s, biz_id=%s, segs=%d",
+            "Client disconnected (wire close, no status=2): sid=%s, trace=%s, biz_id=%s, segs=%d, state=%s",
             session.sid if session else "?",
             session.trace_id if session else "?",
             session.biz_id if session else "?",
             session.seg_id if session else 0,
+            session.state.value if session else "no_session",
         )
     except asyncio.TimeoutError:
         logger.warning("Handshake timeout")
@@ -137,13 +150,24 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         await _close_connection(websocket, session)
     finally:
         if session:
+            pending_tasks = len([t for t in session._pending_asr_tasks if not t.done()])
+            logger.info(
+                "Cleaning up session: sid=%s, state=%s, pending_asr_tasks=%d",
+                session.sid, session.state.value, pending_tasks,
+            )
             session.close()  # 取消后台 ASR 任务 + 从 VAD 批处理器注销
             connection_manager.unregister(session.sid)
             connection_slot_released = True
             asr_connections_current.dec()
+            logger.info(
+                "Session cleanup complete: sid=%s, remaining_slots=%d/%d",
+                session.sid,
+                connection_manager._active_count, connection_manager._max_connections,
+            )
         elif not connection_slot_released:
             connection_manager.release_slot()
             connection_slot_released = True
+            logger.info("Released slot for session-less connection")
 
 
 # ============================================================
@@ -162,14 +186,28 @@ async def _handle_handshake(websocket: WebSocket) -> ASRSession | None:
         raise
 
     msg = ClientMessage.model_validate_json(raw)
+    logger.info(
+        "Handshake frame received: status=%d, traceId=%s, bizId=%s",
+        msg.header.status,
+        msg.header.traceId,
+        msg.header.bizId,
+    )
     if msg.header.status != 0:
-        logger.warning("First message must be handshake (status=0)")
+        logger.warning(
+            "First message must be handshake (status=0), got status=%d, traceId=%s — connection will be closed",
+            msg.header.status,
+            msg.header.traceId,
+        )
         return None
 
     session = ASRSession(
         trace_id=msg.header.traceId,
         biz_id=msg.header.bizId,
         app_id=msg.header.appId or "",
+    )
+    logger.info(
+        "ASRSession created: sid=%s, trace=%s, biz_id=%s, vad_instance=%s",
+        session.sid, session.trace_id, session.biz_id, id(session.vad),
     )
 
     # 追加客户端热词（与环境变量默认热词合并）

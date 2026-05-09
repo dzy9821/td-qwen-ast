@@ -59,6 +59,7 @@ class TenVADSession:
     def __init__(self, sid: str) -> None:
         self._sid = sid
         self._vad = TenVad(hop_size=HOP_SIZE, threshold=VAD_THRESHOLD)
+        logger.info("TenVAD instance created: sid=%s, vad_id=%s", sid, id(self._vad))
         self.hop_size = HOP_SIZE
         self.frame_duration = self.hop_size / SAMPLE_RATE  # 秒
 
@@ -127,8 +128,12 @@ class TenVADSession:
     def close(self) -> None:
         """释放 TenVad 实例。"""
         if self._vad is not None:
+            vad_id = id(self._vad)
             del self._vad
             self._vad = None
+            logger.info("TenVAD instance released: sid=%s, vad_id=%s", self._sid, vad_id)
+        else:
+            logger.warning("TenVAD instance already released: sid=%s", self._sid)
 
     # ---- 内部逻辑 ----
 
