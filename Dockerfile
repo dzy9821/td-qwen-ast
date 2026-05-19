@@ -1,5 +1,5 @@
 # ---- 构建 ----
-FROM quay.io/ascend/vllm-ascend:v0.18.0rc1-310p
+FROM quay.io/ascend/vllm-ascend:v0.19.1rc1
 
 # ---- 代理（构建时按需传入 --build-arg HTTP_PROXY=...） ----
 ARG HTTP_PROXY
@@ -71,6 +71,12 @@ RUN ARCH=$(uname -m) && \
     echo "/app/models/vad/ten-vad/lib/Linux/ARCH" > /etc/ld.so.conf.d/tenvad.conf && \
     ldconfig
 ENV LD_LIBRARY_PATH=/app/models/vad/ten-vad/lib/Linux/ARCH:/usr/local/lib
+
+# VL模型ssl
+COPY connections.py /vllm-workspace/vllm/vllm/connections.py
+
+# 翻译代理
+COPY translation_proxy.py /workspace/translation_proxy.py
 
 # ---- 10. 清除构建代理（避免泄露到运行时） ----
 ENV http_proxy="" https_proxy="" no_proxy=""
