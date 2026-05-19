@@ -4,12 +4,16 @@ JSON 结构化日志配置。
 - 输出至 stdout
 - 每条日志自动注入 trace_id 字段
 - 不记录 Base64 音频原文
+- 内存环形缓冲区供 HTTP 流式查询
 """
 
+import asyncio
+import collections
 import logging
 import json
 import sys
 from contextvars import ContextVar
+from threading import Lock
 
 from src.core.config import settings
 
@@ -33,6 +37,45 @@ class JSONFormatter(logging.Formatter):
         return json.dumps(log_entry, ensure_ascii=False)
 
 
+class InMemoryLogHandler(logging.Handler):
+    """将日志写入内存环形缓冲区，并通知所有 SSE 订阅者。"""
+
+    def __init__(self, capacity: int = 2000):
+        super().__init__()
+        self._buffer: collections.deque[str] = collections.deque(maxlen=capacity)
+        self._lock = Lock()
+        self._subscribers: set[asyncio.Queue[str]] = set()
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = self.format(record)
+            with self._lock:
+                self._buffer.append(msg)
+            for q in list(self._subscribers):
+                try:
+                    q.put_nowait(msg)
+                except asyncio.QueueFull:
+                    pass
+        except Exception:
+            self.handleError(record)
+
+    def subscribe(self) -> asyncio.Queue[str]:
+        q: asyncio.Queue[str] = asyncio.Queue(maxsize=500)
+        self._subscribers.add(q)
+        return q
+
+    def unsubscribe(self, q: asyncio.Queue[str]) -> None:
+        self._subscribers.discard(q)
+
+    def get_recent(self, n: int = 50) -> list[str]:
+        with self._lock:
+            items = list(self._buffer)
+        return items[-n:]
+
+
+log_buffer = InMemoryLogHandler(capacity=2000)
+
+
 def setup_logging() -> None:
     """初始化全局日志配置。"""
     root = logging.getLogger()
@@ -44,6 +87,9 @@ def setup_logging() -> None:
     handler = logging.StreamHandler(sys.stdout)
     handler.setFormatter(JSONFormatter(datefmt="%Y-%m-%dT%H:%M:%S"))
     root.addHandler(handler)
+
+    log_buffer.setFormatter(JSONFormatter(datefmt="%Y-%m-%dT%H:%M:%S"))
+    root.addHandler(log_buffer)
 
     # 降低第三方库日志级别
     for name in ("uvicorn", "uvicorn.access", "httpx", "httpcore"):
