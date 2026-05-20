@@ -15,7 +15,7 @@ services:
       - /usr/local/Ascend/driver/lib64/:/usr/local/Ascend/driver/lib64/:ro
       - /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info:ro
       - /etc/ascend_install.info:/etc/ascend_install.info:ro
-      - ./models/Qwen3-ASR-1.7B:/weights/Qwen3-ASR-1.7B:ro
+      - ./weights/Qwen3-ASR-1.7B:/weights/Qwen3-ASR-1.7B:ro
 
     environment:
       # ---- NPU 设备可见性 ----

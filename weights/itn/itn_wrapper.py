@@ -10,7 +10,7 @@ class ITNProcessor:
     def __init__(self, model_path=None, lang="zh"):
         if model_path is None:
             model_path = os.path.join(
-                os.path.dirname(__file__), "..", "..", "weights", "fst_itn_zh"
+                os.path.dirname(__file__), "..", "fst_itn_zh"
             )
         self.model_path = os.path.abspath(model_path)
         self.lang = lang

@@ -21,9 +21,9 @@ from src.core.logging import get_logger
 
 logger = get_logger(__name__)
 
-# ---- 导入 TEN-VAD（本地 models/vad/ten-vad/） ----
+# ---- 导入 TEN-VAD（本地 weights/vad/ten-vad/） ----
 _vad_include = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "..", "..", "models", "vad", "ten-vad", "include")
+    os.path.join(os.path.dirname(__file__), "..", "..", "weights", "vad", "ten-vad", "include")
 )
 if _vad_include not in sys.path:
     sys.path.insert(0, _vad_include)

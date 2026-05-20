@@ -28,6 +28,7 @@ dev = [
 [tool.pyrefly]
 python-version = "3.11"
 search_path = ["."]
+reportMissingImports = "none"
 
 [tool.ruff]
 target-version = "py311"
