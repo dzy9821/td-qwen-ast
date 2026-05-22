@@ -1,18 +1,164 @@
+import argparse
 import asyncio
 import base64
+import hashlib
 import json
-import time
-import argparse
-import wave
-import struct
 import math
 import os
+import ssl
+import struct
+import time
+import wave
 
-try:
-    import websockets
-except ImportError:
-    print("Error: 'websockets' is not installed. Please install it using 'pip install websockets'.")
-    exit(1)
+
+# ============================================================
+# Minimal WebSocket client (stdlib only, no third-party deps)
+# ============================================================
+
+class _SimpleWS:
+    """Minimal WebSocket client — asyncio + ssl, no third-party packages."""
+
+    class ConnectionClosed(Exception):
+        """Server closed the connection."""
+        pass
+
+    def __init__(self, reader, writer):
+        self._reader = reader
+        self._writer = writer
+
+    @classmethod
+    async def connect(cls, url, open_timeout=5.0):
+        if url.startswith("ws://"):
+            rest = url[5:]
+            use_ssl = False
+        elif url.startswith("wss://"):
+            rest = url[6:]
+            use_ssl = True
+        else:
+            raise ValueError(f"Unsupported WS URL scheme: {url}")
+
+        if "/" in rest:
+            host_port, path = rest.split("/", 1)
+            path = "/" + path
+        else:
+            host_port = rest
+            path = "/"
+
+        if ":" in host_port:
+            host, port_str = host_port.rsplit(":", 1)
+            port = int(port_str)
+        else:
+            host = host_port
+            port = 443 if use_ssl else 80
+
+        ssl_ctx = ssl.create_default_context() if use_ssl else None
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port, ssl=ssl_ctx),
+            timeout=open_timeout,
+        )
+
+        # WebSocket upgrade handshake
+        key = base64.b64encode(os.urandom(16)).decode()
+        req = (
+            f"GET {path} HTTP/1.1\r\n"
+            f"Host: {host}:{port}\r\n"
+            f"Upgrade: websocket\r\n"
+            f"Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {key}\r\n"
+            f"Sec-WebSocket-Version: 13\r\n"
+            f"\r\n"
+        )
+        writer.write(req.encode())
+        await writer.drain()
+
+        resp = await asyncio.wait_for(
+            reader.readuntil(b"\r\n\r\n"), timeout=open_timeout
+        )
+        resp_text = resp.decode(errors="replace")
+        if "101" not in resp_text:
+            raise Exception(
+                f"WebSocket handshake failed: {resp_text.split(chr(13)+chr(10))[0]}"
+            )
+
+        # Verify accept key
+        expected = base64.b64encode(
+            hashlib.sha1(
+                (key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()
+            ).digest()
+        ).decode()
+        for line in resp_text.split("\r\n"):
+            if line.lower().startswith("sec-websocket-accept:"):
+                got = line.split(":", 1)[1].strip()
+                if got != expected:
+                    raise Exception("WebSocket accept key mismatch")
+                break
+
+        return cls(reader, writer)
+
+    async def send(self, data: str):
+        payload = data.encode()
+        frame = self._frame(0x1, payload, mask=True)
+        self._writer.write(frame)
+        await self._writer.drain()
+
+    async def recv(self) -> str:
+        while True:
+            header = await self._reader.readexactly(2)
+            opcode = header[0] & 0xF
+            plen = header[1] & 0x7F
+
+            if plen == 126:
+                plen = struct.unpack("!H", await self._reader.readexactly(2))[0]
+            elif plen == 127:
+                plen = struct.unpack("!Q", await self._reader.readexactly(8))[0]
+
+            masked = (header[1] & 0x80) != 0
+            mask = await self._reader.readexactly(4) if masked else b""
+
+            payload = await self._reader.readexactly(plen)
+            if masked:
+                payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+
+            if opcode == 0x1:  # text
+                return payload.decode()
+            elif opcode == 0x8:  # close
+                code = struct.unpack("!H", payload[:2])[0] if len(payload) >= 2 else 1000
+                raise _SimpleWS.ConnectionClosed(code)
+            elif opcode == 0x9:  # ping → pong
+                pong = self._frame(0xA, payload, mask=False)
+                self._writer.write(pong)
+                await self._writer.drain()
+            # pong / continuation — continue
+
+    async def close(self):
+        try:
+            self._writer.write(self._frame(0x8, b"", mask=True))
+            await self._writer.drain()
+        except Exception:
+            pass
+        try:
+            self._writer.close()
+            await self._writer.wait_closed()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _frame(opcode, payload, mask):
+        frame = bytes([0x80 | opcode])
+        plen = len(payload)
+        if plen < 126:
+            frame += bytes([(0x80 if mask else 0x00) | plen])
+        elif plen < 65536:
+            frame += bytes([(0x80 if mask else 0x00) | 126]) + struct.pack("!H", plen)
+        else:
+            frame += bytes([(0x80 if mask else 0x00) | 127]) + struct.pack("!Q", plen)
+
+        if mask:
+            mk = os.urandom(4)
+            frame += mk
+            payload = bytes(b ^ mk[i % 4] for i, b in enumerate(payload))
+
+        return frame + payload
 
 class SegmentMetrics:
     def __init__(self, bg_ms, ed_ms, text, recv_time):
@@ -139,7 +285,8 @@ async def _run_connection(conn_id, url, chunks, chunk_samples, args, start_delay
     biz_id = f"bench_{conn_id}"
 
     try:
-        async with websockets.connect(url, open_timeout=args.open_timeout) as ws:
+        ws = await _SimpleWS.connect(url, open_timeout=args.open_timeout)
+        try:
 
             # --- Handshake (status=0) ---
             handshake = {
@@ -199,7 +346,7 @@ async def _run_connection(conn_id, url, chunks, chunk_samples, args, start_delay
                 while True:
                     try:
                         msg = await ws.recv()
-                    except websockets.exceptions.ConnectionClosed:
+                    except _SimpleWS.ConnectionClosed:
                         break
 
                     resp = json.loads(msg)
@@ -215,6 +362,9 @@ async def _run_connection(conn_id, url, chunks, chunk_samples, args, start_delay
 
             await asyncio.gather(send_audio(), recv_results())
             metrics.success = True
+
+        finally:
+            await ws.close()
 
     except Exception as e:
         metrics.error = str(e)
