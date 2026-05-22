@@ -124,8 +124,8 @@ class _SimpleWS:
             elif opcode == 0x8:  # close
                 code = struct.unpack("!H", payload[:2])[0] if len(payload) >= 2 else 1000
                 raise _SimpleWS.ConnectionClosed(code)
-            elif opcode == 0x9:  # ping → pong
-                pong = self._frame(0xA, payload, mask=False)
+            elif opcode == 0x9:  # ping → pong (client MUST mask)
+                pong = self._frame(0xA, payload, mask=True)
                 self._writer.write(pong)
                 await self._writer.drain()
             # pong / continuation — continue
