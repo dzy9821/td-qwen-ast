@@ -168,7 +168,7 @@ class SegmentMetrics:
         self.recv_time = recv_time # relative to connection start
         self.asr_ms = 0
         self.total_ms = 0
-        self.segment_e2e_ms = 0
+        self.segment_e2e_ms = 0.0
 
 class ConnectionMetrics:
     def __init__(self, conn_id):
@@ -280,7 +280,6 @@ async def _run_connection(conn_id, url, chunks, chunk_samples, args, start_delay
     if start_delay > 0:
         await asyncio.sleep(start_delay)
 
-    conn_start_time = time.monotonic()
     trace_id = f"bench_{conn_id}"
     biz_id = f"bench_{conn_id}"
 
@@ -307,9 +306,17 @@ async def _run_connection(conn_id, url, chunks, chunk_samples, args, start_delay
             except asyncio.TimeoutError:
                 raise Exception("Handshake timeout")
 
+            # ---- Per-chunk send timestamps (client clock as authoritative time base) ----
+            chunk_duration = chunk_samples / 16000.0
+            chunk_ms = chunk_duration * 1000.0
+            send_times: list[float] = []  # send_times[i] = time.monotonic() when chunk i was sent
+
+            # VAD post-padding frames (ASR_PAD_FRAMES * HOP_SIZE samples)
+            PAD_SAMPLES = 5 * 640
+            PAD_MS = PAD_SAMPLES * 1000.0 / 16000.0  # 200ms
+
             async def send_audio():
                 t_base = time.monotonic()
-                chunk_duration = chunk_samples / 16000.0
                 for i, chunk in enumerate(chunks):
                     target_time = t_base + i * chunk_duration
                     now = time.monotonic()
@@ -331,6 +338,7 @@ async def _run_connection(conn_id, url, chunks, chunk_samples, args, start_delay
                         },
                     }
                     await ws.send(json.dumps(req))
+                    send_times.append(time.monotonic())
 
                 # Send EOS (status=2)
                 req = {
@@ -354,11 +362,11 @@ async def _run_connection(conn_id, url, chunks, chunk_samples, args, start_delay
 
                     # End of session (status=2) — may carry final segment result
                     if header.get("status") == 2:
-                        _extract_segment(resp, conn_start_time, metrics)
+                        _extract_segment(resp, send_times, chunk_ms, PAD_MS, metrics)
                         break
 
                     # Segment result (status=1)
-                    _extract_segment(resp, conn_start_time, metrics)
+                    _extract_segment(resp, send_times, chunk_ms, PAD_MS, metrics)
 
             await asyncio.gather(send_audio(), recv_results())
             metrics.success = True
@@ -372,8 +380,14 @@ async def _run_connection(conn_id, url, chunks, chunk_samples, args, start_delay
     return metrics
 
 
-def _extract_segment(resp, conn_start_time, metrics):
-    """Extract a segment result from a server response, if present."""
+def _extract_segment(resp, send_times, chunk_ms, pad_ms, metrics):
+    """Extract a segment result and compute client-clock-based E2E delay.
+
+    E2E = receive_time - send_time_of_last_speech_frame
+    where send_time_of_last_speech_frame is looked up via the client-side
+    send timestamp records, mapped from the server-reported ed_ms (minus
+    VAD post-padding frames).
+    """
     result = resp.get("payload", {}).get("result", {})
     ws_list = result.get("ws", [])
     if not ws_list:
@@ -382,13 +396,26 @@ def _extract_segment(resp, conn_start_time, metrics):
     if not cw_list:
         return
 
-    recv_wall_ms = (time.monotonic() - conn_start_time) * 1000.0
+    recv_time = time.monotonic()
     bg_ms = result.get("bg", 0)
     ed_ms = result.get("ed", 0)
     text = cw_list[0].get("w", "")
 
-    seg = SegmentMetrics(bg_ms, ed_ms, text, recv_wall_ms)
-    seg.segment_e2e_ms = recv_wall_ms - ed_ms
+    # Actual speech end = ed_ms minus VAD post-padding frames
+    speech_end_ms = max(0.0, ed_ms - pad_ms)
+
+    # Find the send timestamp of the chunk containing this audio position
+    chunk_idx = int(speech_end_ms / chunk_ms)
+    if send_times and chunk_idx < len(send_times):
+        send_t = send_times[chunk_idx]
+        e2e_ms = (recv_time - send_t) * 1000.0
+    else:
+        # Fallback: can't map, use first send time
+        send_t = send_times[0] if send_times else recv_time
+        e2e_ms = (recv_time - send_t) * 1000.0 - speech_end_ms
+
+    seg = SegmentMetrics(bg_ms, ed_ms, text, recv_time)
+    seg.segment_e2e_ms = e2e_ms
     metrics.segments.append(seg)
 
 def _detect_bottlenecks(metrics):
