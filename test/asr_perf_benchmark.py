@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import time
 import argparse
@@ -134,10 +135,31 @@ async def _run_connection(conn_id, url, chunks, chunk_samples, args, start_delay
         await asyncio.sleep(start_delay)
 
     conn_start_time = time.monotonic()
-    
+    trace_id = f"bench_{conn_id}"
+    biz_id = f"bench_{conn_id}"
+
     try:
         async with websockets.connect(url, open_timeout=args.open_timeout) as ws:
-            
+
+            # --- Handshake (status=0) ---
+            handshake = {
+                "header": {
+                    "traceId": trace_id,
+                    "bizId": biz_id,
+                    "status": 0,
+                }
+            }
+            await ws.send(json.dumps(handshake))
+
+            # Wait for handshake response (status=0)
+            try:
+                raw = await asyncio.wait_for(ws.recv(), timeout=args.recv_timeout)
+                resp = json.loads(raw)
+                if resp.get("header", {}).get("status") != 0:
+                    raise Exception(f"Handshake rejected: {resp}")
+            except asyncio.TimeoutError:
+                raise Exception("Handshake timeout")
+
             async def send_audio():
                 t_base = time.monotonic()
                 chunk_duration = chunk_samples / 16000.0
@@ -146,65 +168,78 @@ async def _run_connection(conn_id, url, chunks, chunk_samples, args, start_delay
                     now = time.monotonic()
                     if now < target_time:
                         await asyncio.sleep(target_time - now)
-                    
+
+                    b64 = base64.b64encode(chunk).decode()
                     req = {
                         "header": {
-                            "action": "run",
-                            "task_id": f"task_{conn_id}_{i}"
+                            "traceId": trace_id,
+                            "bizId": biz_id,
+                            "status": 1,
                         },
                         "payload": {
-                            "audio": chunk.hex(),
-                            "is_speaking": True,
-                            "encoding": "pcm"
-                        }
+                            "audio": {
+                                "audio": b64,
+                                "encoding": None,
+                            }
+                        },
                     }
                     await ws.send(json.dumps(req))
-                
-                # Send EOS
+
+                # Send EOS (status=2)
                 req = {
                     "header": {
-                        "action": "run",
-                        "task_id": f"task_{conn_id}_eos"
-                    },
-                    "payload": {
-                        "audio": "",
-                        "is_speaking": False,
-                        "encoding": "pcm"
+                        "traceId": trace_id,
+                        "bizId": biz_id,
+                        "status": 2,
                     }
                 }
                 await ws.send(json.dumps(req))
-            
+
             async def recv_results():
                 while True:
                     try:
-                        msg = await asyncio.wait_for(ws.recv(), timeout=args.recv_timeout)
-                        resp = json.loads(msg)
-                        payload = resp.get("payload", {})
-                        
-                        if payload.get("is_final", False):
-                            recv_wall_ms = (time.monotonic() - conn_start_time) * 1000.0
-                            bg_ms = payload.get("bg", 0)
-                            ed_ms = payload.get("ed", 0)
-                            text = payload.get("text", "")
-                            
-                            seg = SegmentMetrics(bg_ms, ed_ms, text, recv_wall_ms)
-                            seg.segment_e2e_ms = recv_wall_ms - ed_ms
-                            metrics.segments.append(seg)
-                        
-                        # Stop on status=2
-                        if resp.get("header", {}).get("status") == 2:
-                            break
-                            
-                    except asyncio.TimeoutError:
+                        msg = await ws.recv()
+                    except websockets.exceptions.ConnectionClosed:
                         break
-            
+
+                    resp = json.loads(msg)
+                    header = resp.get("header", {})
+
+                    # End of session (status=2) — may carry final segment result
+                    if header.get("status") == 2:
+                        _extract_segment(resp, conn_start_time, metrics)
+                        break
+
+                    # Segment result (status=1)
+                    _extract_segment(resp, conn_start_time, metrics)
+
             await asyncio.gather(send_audio(), recv_results())
             metrics.success = True
-            
+
     except Exception as e:
         metrics.error = str(e)
-    
+
     return metrics
+
+
+def _extract_segment(resp, conn_start_time, metrics):
+    """Extract a segment result from a server response, if present."""
+    result = resp.get("payload", {}).get("result", {})
+    ws_list = result.get("ws", [])
+    if not ws_list:
+        return
+    cw_list = ws_list[0].get("cw", [])
+    if not cw_list:
+        return
+
+    recv_wall_ms = (time.monotonic() - conn_start_time) * 1000.0
+    bg_ms = result.get("bg", 0)
+    ed_ms = result.get("ed", 0)
+    text = cw_list[0].get("w", "")
+
+    seg = SegmentMetrics(bg_ms, ed_ms, text, recv_wall_ms)
+    seg.segment_e2e_ms = recv_wall_ms - ed_ms
+    metrics.segments.append(seg)
 
 def _detect_bottlenecks(metrics):
     metrics.segments.sort(key=lambda x: x.bg_ms)
@@ -301,21 +336,62 @@ def generate_report(results, args, audio_duration_ms):
         lines.append(row)
         
     lines.append("")
-    lines.append("二、各并发级别详细报告")
-    
+    lines.append("二、分段延迟对比表（行=段序号，列=并发级别，值=平均E2E延迟ms）")
+
+    # Collect per-segment-index data across all levels
+    has_segments = False
+    max_segs = 0
+    level_seg_data: dict[int, dict[int, list[float]]] = {}  # level -> {seg_idx: [e2e_ms, ...]}
+    for res in results:
+        seg_map: dict[int, list[float]] = {}
+        for c in res.connections:
+            for idx, s in enumerate(c.segments):
+                seg_map.setdefault(idx, []).append(s.segment_e2e_ms)
+        if seg_map:
+            has_segments = True
+            max_segs = max(max_segs, max(seg_map.keys()))
+        level_seg_data[res.level] = seg_map
+
+    levels_sorted = sorted(level_seg_data.keys())
+
+    if has_segments:
+        # Header
+        header = f"{'段序号':<8}"
+        for lv in levels_sorted:
+            header += f" | {'并发'+str(lv):<12}"
+        lines.append(header)
+        lines.append("-" * len(header))
+
+        # Rows
+        for seg_idx in range(max_segs + 1):
+            row = f"{seg_idx:<8}"
+            for lv in levels_sorted:
+                values = level_seg_data.get(lv, {}).get(seg_idx, [])
+                if values:
+                    avg = sum(values) / len(values)
+                    row += f" | {avg:<12.1f}"
+                else:
+                    row += f" | {'-':<12}"
+            lines.append(row)
+    else:
+        lines.append("  无有效数据")
+
+    lines.append("")
+    lines.append("三、各并发级别详细报告")
+
     for res in results:
         lines.append(f"\n--- 并发级别 {res.level} ---")
-        lines.append("2.1 资源使用曲线（采样间隔 ~1s）")
+        lines.append("3.1 资源使用曲线（采样间隔 ~1s）")
         lines.append(f"{'时间':<10} | {'CPU (%)':<10} | {'MEM (MB)':<10}")
         for i, s in enumerate(res.resource_samples):
             lines.append(f"{i:<10} | {s.cpu_percent:<10.1f} | {s.mem_used_mb:<10.0f}")
-            
-        lines.append("\n2.2 E2E 延迟统计")
+
+        lines.append("\n3.2 E2E 延迟统计")
         all_e2e = []
         for c in res.connections:
             for s in c.segments:
                 all_e2e.append(s.segment_e2e_ms)
-        
+
         if all_e2e:
             lines.append(f"  - avg: {sum(all_e2e)/len(all_e2e):.1f} ms")
             lines.append(f"  - p50: {percentile(all_e2e, 50):.1f} ms")
@@ -323,8 +399,8 @@ def generate_report(results, args, audio_duration_ms):
             lines.append(f"  - max: {max(all_e2e):.1f} ms")
         else:
             lines.append("  无有效数据")
-            
-        lines.append("\n2.3 瓶颈检测详情")
+
+        lines.append("\n3.3 瓶颈检测详情")
         total_bn = sum(c.bottleneck_count for c in res.connections)
         lines.append(f"  - 总计瓶颈次数: {total_bn}")
         for c in res.connections:
@@ -332,8 +408,8 @@ def generate_report(results, args, audio_duration_ms):
                 lines.append(f"  - 连接 {c.conn_id}: 瓶颈 {c.bottleneck_count} 次")
                 for d in c.bottleneck_details:
                     lines.append(f"      第 {d['seg_idx']} 段延迟导致瓶颈，超出 {d['diff']:.1f} ms")
-                    
-        lines.append("\n2.4 分段明细 (仅展示出现问题的连接的前几个分段)")
+
+        lines.append("\n3.4 分段明细 (仅展示出现问题的连接的前几个分段)")
         for c in res.connections:
             if c.error:
                 lines.append(f"  - 连接 {c.conn_id}: 失败 ({c.error})")
@@ -344,7 +420,7 @@ def generate_report(results, args, audio_duration_ms):
                 if len(c.segments) > 5:
                     lines.append("      ...")
 
-    lines.append("\n三、报告结束")
+    lines.append("\n四、报告结束")
     lines.append("====================================================================")
     
     report_text = "\n".join(lines)
@@ -362,7 +438,7 @@ async def amain():
     parser.add_argument("--chunk-samples", type=int, default=640)
     parser.add_argument("--open-timeout", type=float, default=5.0)
     parser.add_argument("--recv-timeout", type=float, default=10.0)
-    parser.add_argument("--stagger-ms", type=float, default=20.0)
+    parser.add_argument("--stagger-ms", type=float, default=2.0)
     parser.add_argument("--cooldown", type=float, default=10.0)
     parser.add_argument("--output", default="asr_perf_report.txt")
     
