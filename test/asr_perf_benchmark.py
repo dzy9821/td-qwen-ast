@@ -324,8 +324,13 @@ async def _run_connection(conn_id, url, chunks, chunk_samples, args, start_delay
                 for i, chunk in enumerate(chunks):
                     target_time = t_base + i * chunk_duration
                     now = time.monotonic()
-                    if now < target_time:
-                        await asyncio.sleep(target_time - now)
+                    delay = target_time - now
+                    if delay > 0:
+                        await asyncio.sleep(delay)
+                    else:
+                        # Even when behind schedule, yield to let recv_results() run.
+                        # Without this, drain() may not truly yield and recv starves.
+                        await asyncio.sleep(0)
 
                     b64 = base64.b64encode(chunk).decode()
                     req = {
@@ -361,16 +366,16 @@ async def _run_connection(conn_id, url, chunks, chunk_samples, args, start_delay
                     except _SimpleWS.ConnectionClosed:
                         break
 
+                    # Capture recv timestamp immediately after socket read
+                    recv_ts = time.monotonic()
                     resp = json.loads(msg)
                     header = resp.get("header", {})
 
-                    # End of session (status=2) — may carry final segment result
                     if header.get("status") == 2:
-                        _extract_segment(resp, send_times, chunk_ms, PAD_MS, metrics)
+                        _extract_segment(resp, send_times, chunk_ms, PAD_MS, metrics, recv_ts)
                         break
 
-                    # Segment result (status=1)
-                    _extract_segment(resp, send_times, chunk_ms, PAD_MS, metrics)
+                    _extract_segment(resp, send_times, chunk_ms, PAD_MS, metrics, recv_ts)
 
             await asyncio.gather(send_audio(), recv_results())
             metrics.success = True
@@ -384,7 +389,7 @@ async def _run_connection(conn_id, url, chunks, chunk_samples, args, start_delay
     return metrics
 
 
-def _extract_segment(resp, send_times, chunk_ms, pad_ms, metrics):
+def _extract_segment(resp, send_times, chunk_ms, pad_ms, metrics, recv_time=None):
     """Extract a segment result and compute client-clock-based E2E delay.
 
     E2E = receive_time - send_time_of_last_speech_frame
@@ -400,7 +405,8 @@ def _extract_segment(resp, send_times, chunk_ms, pad_ms, metrics):
     if not cw_list:
         return
 
-    recv_time = time.monotonic()
+    if recv_time is None:
+        recv_time = time.monotonic()
     bg_ms = result.get("bg", 0)
     ed_ms = result.get("ed", 0)
     text = cw_list[0].get("w", "")
@@ -431,7 +437,6 @@ def _extract_segment(resp, send_times, chunk_ms, pad_ms, metrics):
         e2e_ms = (recv_time - send_t) * 1000.0 - speech_end_ms
 
     # Convert recv_time to audio-clock ms (relative to first chunk send time)
-    # This allows comparison with ed_ms for bottleneck detection.
     audio_clock_base = send_times[0] if send_times else recv_time
     recv_audio_clock_ms = (recv_time - audio_clock_base) * 1000.0
 
@@ -646,13 +651,17 @@ def generate_report(results, args, audio_duration_ms):
     has_any_segments = False
     for res in results:
         # Collect per-segment-index data across all connections in this level
-        seg_e2e = {}   # type: Dict[int, List[float]]
+        seg_e2e = {}    # type: Dict[int, List[float]]
         seg_total = {}  # type: Dict[int, List[float]]
-        seg_asr = {}   # type: Dict[int, List[float]]
+        seg_asr = {}    # type: Dict[int, List[float]]
+        seg_bg = {}     # type: Dict[int, List[int]]
+        seg_ed = {}     # type: Dict[int, List[int]]
         max_seg_idx = -1
         for c in res.connections:
             for idx, s in enumerate(c.segments):
                 seg_e2e.setdefault(idx, []).append(s.segment_e2e_ms)
+                seg_bg.setdefault(idx, []).append(s.bg_ms)
+                seg_ed.setdefault(idx, []).append(s.ed_ms)
                 if s.total_ms > 0:
                     seg_total.setdefault(idx, []).append(s.total_ms)
                 if s.asr_ms > 0:
@@ -666,21 +675,28 @@ def generate_report(results, args, audio_duration_ms):
         lines.append(f"  ▸ 并发级别 {res.level} ({sum(1 for c in res.connections if c.success)}/{len(res.connections)} 成功)")
         lines.append("")
 
-        seg_headers = ["段#", "E2E avg(ms)", "total avg(ms)", "差值(ms)", "ASR avg(ms)"]
-        seg_aligns = [">", ">", ">", ">", ">"]
+        seg_headers = ["段#", "区间(ms)", "E2E avg(ms)", "total avg(ms)", "差值(ms)", "ASR avg(ms)"]
+        seg_aligns = [">", "<", ">", ">", ">", ">"]
         seg_rows = []
         for seg_idx in range(max_seg_idx + 1):
             e2e_vals = seg_e2e.get(seg_idx, [])
             total_vals = seg_total.get(seg_idx, [])
             asr_vals = seg_asr.get(seg_idx, [])
+            bg_vals = seg_bg.get(seg_idx, [])
+            ed_vals = seg_ed.get(seg_idx, [])
 
             e2e_avg = sum(e2e_vals) / len(e2e_vals) if e2e_vals else 0
             total_avg = sum(total_vals) / len(total_vals) if total_vals else 0
             asr_avg = sum(asr_vals) / len(asr_vals) if asr_vals else 0
             diff = e2e_avg - total_avg if total_vals else 0
 
+            # Use the most common bg/ed (or first connection's value)
+            bg_rep = int(sum(bg_vals) / len(bg_vals)) if bg_vals else 0
+            ed_rep = int(sum(ed_vals) / len(ed_vals)) if ed_vals else 0
+
             seg_rows.append([
                 f"第{seg_idx}段",
+                f"{bg_rep}-{ed_rep}",
                 f"{e2e_avg:.0f}" if e2e_vals else "-",
                 f"{total_avg:.0f}" if total_vals else "-",
                 f"{diff:.0f}" if total_vals else "-",
@@ -697,6 +713,7 @@ def generate_report(results, args, audio_duration_ms):
         total_diff = total_e2e_avg - total_total_avg if all_total else 0
         seg_rows.append([
             "整体avg",
+            "-",
             f"{total_e2e_avg:.0f}" if all_e2e else "-",
             f"{total_total_avg:.0f}" if all_total else "-",
             f"{total_diff:.0f}" if all_total else "-",
