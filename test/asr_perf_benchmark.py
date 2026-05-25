@@ -165,9 +165,9 @@ class SegmentMetrics:
         self.bg_ms = bg_ms
         self.ed_ms = ed_ms
         self.text = text
-        self.recv_time = recv_time # relative to connection start
-        self.asr_ms = 0
-        self.total_ms = 0
+        self.recv_time = recv_time
+        self.asr_ms = 0.0
+        self.total_ms = 0.0
         self.segment_e2e_ms = 0.0
 
 class ConnectionMetrics:
@@ -401,6 +401,19 @@ def _extract_segment(resp, send_times, chunk_ms, pad_ms, metrics):
     ed_ms = result.get("ed", 0)
     text = cw_list[0].get("w", "")
 
+    # Parse server-side timing from header.message (JSON: {"asr_ms": ..., "total_ms": ...})
+    server_asr_ms = 0.0
+    server_total_ms = 0.0
+    header = resp.get("header", {})
+    msg_str = header.get("message", "")
+    if msg_str and msg_str.startswith("{"):
+        try:
+            timing = json.loads(msg_str)
+            server_asr_ms = float(timing.get("asr_ms", 0))
+            server_total_ms = float(timing.get("total_ms", 0))
+        except (json.JSONDecodeError, ValueError, TypeError):
+            pass
+
     # Actual speech end = ed_ms minus VAD post-padding frames
     speech_end_ms = max(0.0, ed_ms - pad_ms)
 
@@ -410,11 +423,12 @@ def _extract_segment(resp, send_times, chunk_ms, pad_ms, metrics):
         send_t = send_times[chunk_idx]
         e2e_ms = (recv_time - send_t) * 1000.0
     else:
-        # Fallback: can't map, use first send time
         send_t = send_times[0] if send_times else recv_time
         e2e_ms = (recv_time - send_t) * 1000.0 - speech_end_ms
 
     seg = SegmentMetrics(bg_ms, ed_ms, text, recv_time)
+    seg.asr_ms = server_asr_ms
+    seg.total_ms = server_total_ms
     seg.segment_e2e_ms = e2e_ms
     metrics.segments.append(seg)
 
@@ -471,54 +485,206 @@ def percentile(data, p):
     idx = max(0, min(idx, len(s_data) - 1))
     return s_data[idx]
 
-def generate_report(results, args, audio_duration_ms):
+def _display_width(s: str) -> int:
+    """Calculate display width accounting for CJK double-width characters."""
+    width = 0
+    for ch in s:
+        if '\u4e00' <= ch <= '\u9fff' or '\u3000' <= ch <= '\u303f' or '\uff00' <= ch <= '\uffef':
+            width += 2
+        else:
+            width += 1
+    return width
+
+
+def _pad(s: str, width: int, align: str = "<") -> str:
+    """Pad string to target display width, respecting CJK double-width."""
+    cur = _display_width(s)
+    pad_n = max(0, width - cur)
+    if align == ">":
+        return " " * pad_n + s
+    elif align == "^":
+        left = pad_n // 2
+        return " " * left + s + " " * (pad_n - left)
+    return s + " " * pad_n
+
+
+def _table(headers: list[str], rows: list[list[str]], col_aligns: list[str] | None = None) -> list[str]:
+    """Build a formatted ASCII table with box-drawing borders.
+
+    col_aligns: list of '<' (left), '>' (right), '^' (center) per column.
+    """
+    n_cols = len(headers)
+    if col_aligns is None:
+        col_aligns = ["<"] * n_cols
+
+    col_widths = [_display_width(h) for h in headers]
+    for row in rows:
+        for i, cell in enumerate(row):
+            col_widths[i] = max(col_widths[i], _display_width(cell))
+
+    for i in range(n_cols):
+        col_widths[i] += 2
+
+    def _sep(left, mid, right, fill="─"):
+        parts = [fill * w for w in col_widths]
+        return left + mid.join(parts) + right
+
+    def _row(cells, aligns):
+        parts = []
+        for i, cell in enumerate(cells):
+            inner = _pad(cell, col_widths[i] - 2, aligns[i])
+            parts.append(" " + inner + " ")
+        return "│" + "│".join(parts) + "│"
+
     lines = []
-    lines.append("====================================================================")
-    lines.append("ASR 端到端性能基准测试报告")
-    lines.append("====================================================================")
-    lines.append(f"生成时间: {time.strftime('%Y-%m-%d %H:%M:%S')}")
-    lines.append(f"服务地址: {args.url}")
-    lines.append(f"音频信息: {args.audio} ({audio_duration_ms/1000.0:.2f}s)")
-    lines.append(f"并发级别: {','.join(map(str, args.levels))}")
+    lines.append(_sep("┌", "┬", "┐"))
+    # Header row — always center-aligned
+    lines.append(_row(headers, ["^"] * n_cols))
+    lines.append(_sep("├", "┼", "┤"))
+    for row in rows:
+        lines.append(_row(row, col_aligns))
+    lines.append(_sep("└", "┴", "┘"))
+    return lines
+
+
+def generate_report(results, args, audio_duration_ms):
+    W = 78
+    lines = []
+
+    # Title
+    lines.append("╔" + "═" * W + "╗")
+    title = "ASR 端到端性能基准测试报告"
+    lines.append("║" + _pad(title, W, "^") + "║")
+    lines.append("╚" + "═" * W + "╝")
     lines.append("")
-    
-    lines.append("一、汇总总览表")
-    header = f"{'并发':<6} | {'成功':<5} | {'失败':<5} | {'总耗时(s)':<8} | {'CPU avg':<8} | {'CPU max':<8} | {'MEM avg':<8} | {'MEM max':<8} | {'E2E avg':<8} | {'E2E P99':<8} | {'瓶颈次数':<8} | {'整体RTF':<8}"
-    lines.append(header)
-    lines.append("-" * len(header))
-    
+
+    # Meta info
+    lines.append(f"  生成时间 : {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    lines.append(f"  服务地址 : {args.url}")
+    lines.append(f"  音频文件 : {os.path.basename(args.audio)} ({audio_duration_ms/1000.0:.2f}s)")
+    lines.append(f"  并发级别 : {args.levels}")
+    lines.append("")
+
+    # Section 1: Summary
+    lines.append("─" * W)
+    lines.append("  [一] 汇总总览")
+    lines.append("─" * W)
+    lines.append("")
+
+    headers = ["并发", "成功", "失败", "耗时(s)", "CPU%avg", "CPU%max", "MEM avg", "MEM max",
+               "E2E avg", "E2E P99", "瓶颈", "RTF"]
+    col_aligns = [">", ">", ">", ">", ">", ">", ">", ">", ">", ">", ">", ">"]
+    rows = []
+
     for res in results:
         success = sum(1 for c in res.connections if c.success)
         fail = len(res.connections) - success
-        
+
         cpu_avg = sum(s.cpu_percent for s in res.resource_samples) / max(1, len(res.resource_samples))
         cpu_max = max((s.cpu_percent for s in res.resource_samples), default=0.0)
-        
+
         mem_avg = sum(s.mem_used_mb for s in res.resource_samples) / max(1, len(res.resource_samples))
         mem_max = max((s.mem_used_mb for s in res.resource_samples), default=0.0)
-        
+
         all_e2e = []
         bottlenecks = 0
         for c in res.connections:
             bottlenecks += c.bottleneck_count
             for s in c.segments:
                 all_e2e.append(s.segment_e2e_ms)
-        
+
         e2e_avg = sum(all_e2e) / max(1, len(all_e2e))
         e2e_p99 = percentile(all_e2e, 99)
-        
         rtf = res.wall_time / (audio_duration_ms / 1000.0)
-        
-        row = f"{res.level:<6} | {success:<5} | {fail:<5} | {res.wall_time:<10.2f} | {cpu_avg:<8.1f}% | {cpu_max:<8.1f}% | {mem_avg:<8.0f}M | {mem_max:<8.0f}M | {e2e_avg:<8.0f} | {e2e_p99:<8.0f} | {bottlenecks:<8} | {rtf:<8.2f}"
-        lines.append(row)
-        
-    lines.append("")
-    lines.append("二、分段延迟对比表（行=段序号，列=并发级别，值=平均E2E延迟ms）")
 
-    # Collect per-segment-index data across all levels
+        rows.append([
+            str(res.level),
+            str(success),
+            str(fail),
+            f"{res.wall_time:.2f}",
+            f"{cpu_avg:.1f}%",
+            f"{cpu_max:.1f}%",
+            f"{mem_avg:.0f}M",
+            f"{mem_max:.0f}M",
+            f"{e2e_avg:.0f}ms",
+            f"{e2e_p99:.0f}ms",
+            str(bottlenecks),
+            f"{rtf:.2f}",
+        ])
+
+    lines.extend(_table(headers, rows, col_aligns))
+    lines.append("")
+
+    # Section 2: Latency breakdown (E2E vs server total_ms)
+    lines.append("─" * W)
+    lines.append("  [二] 延迟分解对比 (E2E vs 服务端处理耗时)")
+    lines.append("─" * W)
+    lines.append("")
+    lines.append("  E2E = 语音结束帧发出 → 收到结果（含 VAD 断句等待 + ASR + ITN + 排序等待）")
+    lines.append("  服务端 total_ms = ASR + ITN 处理耗时（不含 VAD 等待）")
+    lines.append("  差值 ≈ VAD 静默断句等待 + 结果排序等待")
+    lines.append("")
+
+    has_timing = False
+    for res in results:
+        all_e2e = []
+        all_total = []
+        all_asr = []
+        for c in res.connections:
+            for s in c.segments:
+                all_e2e.append(s.segment_e2e_ms)
+                if s.total_ms > 0:
+                    all_total.append(s.total_ms)
+                    has_timing = True
+                if s.asr_ms > 0:
+                    all_asr.append(s.asr_ms)
+
+        if all_e2e:
+            headers2 = ["指标", "avg", "P50", "P90", "P99", "max"]
+            aligns2 = ["<", ">", ">", ">", ">", ">"]
+            rows2 = []
+            rows2.append([
+                f"E2E (并发{res.level})",
+                f"{sum(all_e2e)/len(all_e2e):.0f}ms",
+                f"{percentile(all_e2e, 50):.0f}ms",
+                f"{percentile(all_e2e, 90):.0f}ms",
+                f"{percentile(all_e2e, 99):.0f}ms",
+                f"{max(all_e2e):.0f}ms",
+            ])
+            if all_total:
+                rows2.append([
+                    f"服务端total (并发{res.level})",
+                    f"{sum(all_total)/len(all_total):.0f}ms",
+                    f"{percentile(all_total, 50):.0f}ms",
+                    f"{percentile(all_total, 90):.0f}ms",
+                    f"{percentile(all_total, 99):.0f}ms",
+                    f"{max(all_total):.0f}ms",
+                ])
+            if all_asr:
+                rows2.append([
+                    f"ASR推理 (并发{res.level})",
+                    f"{sum(all_asr)/len(all_asr):.0f}ms",
+                    f"{percentile(all_asr, 50):.0f}ms",
+                    f"{percentile(all_asr, 90):.0f}ms",
+                    f"{percentile(all_asr, 99):.0f}ms",
+                    f"{max(all_asr):.0f}ms",
+                ])
+            lines.extend(_table(headers2, rows2, aligns2))
+            lines.append("")
+
+    if not has_timing:
+        lines.append("  (服务端未返回 timing 信息，无法分解)")
+        lines.append("")
+
+    # Section 3: Per-segment comparison across concurrency levels
+    lines.append("─" * W)
+    lines.append("  [三] 分段延迟对比 (行=段序号, 列=并发级别, 值=平均E2E ms)")
+    lines.append("─" * W)
+    lines.append("")
+
     has_segments = False
     max_segs = 0
-    level_seg_data: dict[int, dict[int, list[float]]] = {}  # level -> {seg_idx: [e2e_ms, ...]}
+    level_seg_data: dict[int, dict[int, list[float]]] = {}
     for res in results:
         seg_map: dict[int, list[float]] = {}
         for c in res.connections:
@@ -532,78 +698,120 @@ def generate_report(results, args, audio_duration_ms):
     levels_sorted = sorted(level_seg_data.keys())
 
     if has_segments:
-        # Header
-        header = f"{'段序号':<8}"
-        for lv in levels_sorted:
-            header += f" | {'并发'+str(lv):<12}"
-        lines.append(header)
-        lines.append("-" * len(header))
-
-        # Rows
+        seg_headers = ["段#"] + [f"并发{lv}" for lv in levels_sorted]
+        seg_aligns = [">"] + [">"] * len(levels_sorted)
+        seg_rows = []
         for seg_idx in range(max_segs + 1):
-            row = f"{seg_idx:<8}"
+            row = [str(seg_idx)]
             for lv in levels_sorted:
                 values = level_seg_data.get(lv, {}).get(seg_idx, [])
                 if values:
                     avg = sum(values) / len(values)
-                    row += f" | {avg:<12.1f}"
+                    row.append(f"{avg:.0f}")
                 else:
-                    row += f" | {'-':<12}"
-            lines.append(row)
+                    row.append("-")
+            seg_rows.append(row)
+        lines.extend(_table(seg_headers, seg_rows, seg_aligns))
     else:
-        lines.append("  无有效数据")
+        lines.append("  无有效分段数据")
 
     lines.append("")
-    lines.append("三、各并发级别详细报告")
+
+    # Section 4: Detailed per-level report
+    lines.append("─" * W)
+    lines.append("  [四] 各并发级别详细报告")
+    lines.append("─" * W)
 
     for res in results:
-        lines.append(f"\n--- 并发级别 {res.level} ---")
-        lines.append("3.1 资源使用曲线（采样间隔 ~1s）")
-        lines.append(f"{'时间':<10} | {'CPU (%)':<10} | {'MEM (MB)':<10}")
-        for i, s in enumerate(res.resource_samples):
-            lines.append(f"{i:<10} | {s.cpu_percent:<10.1f} | {s.mem_used_mb:<10.0f}")
+        lines.append("")
+        lines.append(f"  ┌── 并发级别 {res.level} ──┐")
+        lines.append("")
 
-        lines.append("\n3.2 E2E 延迟统计")
+        # 4.1 Resource usage
+        lines.append("  4.1 资源使用 (采样间隔 ~1s)")
+        if res.resource_samples:
+            r_headers = ["秒", "CPU %", "MEM MB"]
+            r_aligns = [">", ">", ">"]
+            r_rows = []
+            for i, s in enumerate(res.resource_samples):
+                r_rows.append([str(i), f"{s.cpu_percent:.1f}", f"{s.mem_used_mb:.0f}"])
+            lines.extend(["  " + l for l in _table(r_headers, r_rows, r_aligns)])
+        else:
+            lines.append("      无采样数据")
+        lines.append("")
+
+        # 4.2 E2E latency stats
+        lines.append("  4.2 E2E 延迟分布")
         all_e2e = []
         for c in res.connections:
             for s in c.segments:
                 all_e2e.append(s.segment_e2e_ms)
 
         if all_e2e:
-            lines.append(f"  - avg: {sum(all_e2e)/len(all_e2e):.1f} ms")
-            lines.append(f"  - p50: {percentile(all_e2e, 50):.1f} ms")
-            lines.append(f"  - p99: {percentile(all_e2e, 99):.1f} ms")
-            lines.append(f"  - max: {max(all_e2e):.1f} ms")
+            lines.append(f"      avg : {sum(all_e2e)/len(all_e2e):>8.1f} ms")
+            lines.append(f"      P50 : {percentile(all_e2e, 50):>8.1f} ms")
+            lines.append(f"      P90 : {percentile(all_e2e, 90):>8.1f} ms")
+            lines.append(f"      P99 : {percentile(all_e2e, 99):>8.1f} ms")
+            lines.append(f"      max : {max(all_e2e):>8.1f} ms")
         else:
-            lines.append("  无有效数据")
+            lines.append("      无有效数据")
+        lines.append("")
 
-        lines.append("\n3.3 瓶颈检测详情")
+        # 4.3 Bottleneck detection
+        lines.append("  4.3 瓶颈检测")
         total_bn = sum(c.bottleneck_count for c in res.connections)
-        lines.append(f"  - 总计瓶颈次数: {total_bn}")
-        for c in res.connections:
-            if c.bottleneck_count > 0:
-                lines.append(f"  - 连接 {c.conn_id}: 瓶颈 {c.bottleneck_count} 次")
-                for d in c.bottleneck_details:
-                    lines.append(f"      第 {d['seg_idx']} 段延迟导致瓶颈，超出 {d['diff']:.1f} ms")
+        if total_bn == 0:
+            lines.append("      未检测到瓶颈")
+        else:
+            lines.append(f"      总计瓶颈次数: {total_bn}")
+            for c in res.connections:
+                if c.bottleneck_count > 0:
+                    lines.append(f"      连接 {c.conn_id}: {c.bottleneck_count} 次")
+                    for d in c.bottleneck_details[:3]:
+                        lines.append(f"        └ 第{d['seg_idx']}段结果延迟，超出下一段结束时间 {d['diff']:.0f}ms")
+                    if len(c.bottleneck_details) > 3:
+                        lines.append(f"        └ ... 还有 {len(c.bottleneck_details)-3} 条")
+        lines.append("")
 
-        lines.append("\n3.4 分段明细 (仅展示出现问题的连接的前几个分段)")
+        # 4.4 Segment details
+        lines.append("  4.4 分段明细")
+        shown = False
         for c in res.connections:
             if c.error:
-                lines.append(f"  - 连接 {c.conn_id}: 失败 ({c.error})")
-            elif c.bottleneck_count > 0:
-                lines.append(f"  - 连接 {c.conn_id} 分段:")
-                for i, s in enumerate(c.segments[:5]):
-                    lines.append(f"      [{s.bg_ms}-{s.ed_ms}] e2e={s.segment_e2e_ms:.1f}ms : {s.text}")
-                if len(c.segments) > 5:
-                    lines.append("      ...")
+                lines.append(f"      连接 {c.conn_id}: ✗ {c.error}")
+                shown = True
+            elif c.segments:
+                lines.append(f"      连接 {c.conn_id}: {len(c.segments)} 段")
+                seg_headers = ["#", "区间(ms)", "E2E", "svr_ms", "文本"]
+                seg_aligns = [">", "<", ">", ">", "<"]
+                seg_rows = []
+                display_segs = c.segments[:8] if c.bottleneck_count > 0 else c.segments[:5]
+                for i, s in enumerate(display_segs):
+                    seg_rows.append([
+                        str(i),
+                        f"{s.bg_ms}-{s.ed_ms}",
+                        f"{s.segment_e2e_ms:.0f}",
+                        f"{s.total_ms:.0f}" if s.total_ms > 0 else "-",
+                        s.text[:20] + ("..." if len(s.text) > 20 else ""),
+                    ])
+                if len(c.segments) > len(display_segs):
+                    seg_rows.append(["...", "...", "...", "...", f"(共{len(c.segments)}段)"])
+                lines.extend(["      " + l for l in _table(seg_headers, seg_rows, seg_aligns)])
+                lines.append("")
+                shown = True
+        if not shown:
+            lines.append("      无分段数据")
+        lines.append("")
 
-    lines.append("\n四、报告结束")
-    lines.append("====================================================================")
-    
+    # Footer
+    lines.append("─" * W)
+    lines.append("  报告结束")
+    lines.append("─" * W)
+
     report_text = "\n".join(lines)
     with open(args.output, "w", encoding="utf-8") as f:
         f.write(report_text)
-    
+
     print(f"\nReport saved to {args.output}")
 
 
