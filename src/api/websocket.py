@@ -115,6 +115,10 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
 
             if msg.header.status == 1:
                 await _handle_audio_frame(websocket, session, msg)
+                # Yield to event loop so background ASR tasks can run promptly.
+                # Without this, continuous frame arrival starves create_task'd coroutines.
+                if session._pending_asr_tasks:
+                    await asyncio.sleep(0)
 
             elif msg.header.status == 2:
                 logger.info(

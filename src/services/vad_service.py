@@ -36,6 +36,7 @@ DYNAMIC_RANGE_END = settings.VAD_DYNAMIC_RANGE_END
 K = (T_MAX - T_MIN) / DYNAMIC_RANGE_END if DYNAMIC_RANGE_END > 0 else 0.0
 MIN_SPEECH_DURATION = settings.VAD_MIN_SPEECH
 MAX_SPEECH_DURATION = settings.VAD_MAX_SPEECH
+SPEECH_CONFIRM_FRAMES = settings.VAD_SPEECH_CONFIRM_FRAMES
 
 # ---- TEN-VAD 参数 ----
 HOP_SIZE = settings.VAD_HOP_SIZE              # 640 samples = 40ms @ 16kHz
@@ -79,6 +80,12 @@ class TenVADSession:
         self._speech_frame_count = 0
         self._silence_frame_count = 0
         self._post_count = 0  # 已捕获的后置帧数
+
+        # 连续语音帧确认计数（静默期间的抖动噪音滤除）
+        # 静默状态下需连续 SPEECH_CONFIRM_FRAMES 帧语音才真正重置静默计数，
+        # 否则帧追入 speech_frames 作为上下文，但不中断静默计时。
+        self._pending_speech_count = 0  # 静默期间已累计的连续语音帧数
+        self._pending_speech_frames: list[np.ndarray] = []  # 对应的帧缓冲
 
         # 全局采样计数
         self._total_samples: int = 0
@@ -152,21 +159,47 @@ class TenVADSession:
         while len(self._pre_buffer) > self._pad_frames:
             self._pre_buffer.pop(0)
 
-        if flag == 1:  # 语音
+        if flag == 1:  # 语音帧
             if not self._in_speech:
+                # ---- 尚未进入语音段 ----
                 self._in_speech = True
                 self._speech_frame_count = 0
                 self._silence_frame_count = 0
                 self._post_count = 0
+                self._pending_speech_count = 0
+                self._pending_speech_frames = []
                 self._speech_start_sample = (
                     self._total_samples - self.hop_size
                     - len(self._pre_snapshot) * self.hop_size
                 )
-            self._speech_frame_count += 1
-            self._silence_frame_count = 0
-            self._speech_frames.append(frame)
-        else:  # 静默
+                self._speech_frame_count += 1
+                self._speech_frames.append(frame)
+            elif self._silence_frame_count == 0:
+                # ---- 连续语音中（无静默），正常累计 ----
+                self._speech_frame_count += 1
+                self._speech_frames.append(frame)
+            else:
+                # ---- 静默期间出现语音帧：进入「待确认」逻辑 ----
+                self._pending_speech_count += 1
+                self._pending_speech_frames.append(frame)
+
+                if self._pending_speech_count >= SPEECH_CONFIRM_FRAMES:
+                    # 累计足够帧，确认为真实语音重启 → 归并待确认帧，重置静默计数
+                    self._speech_frames.extend(self._pending_speech_frames)
+                    self._speech_frame_count += self._pending_speech_count
+                    self._silence_frame_count = 0
+                    self._post_count = 0
+                    self._pending_speech_count = 0
+                    self._pending_speech_frames = []
+                # else: 待确认帧不足，暂不重置 _silence_frame_count，继续计时
+        else:  # 静默帧
             if self._in_speech:
+                # 如果有待确认的语音帧，将其视为噪音并并入已捕获帧（作为上下文）
+                if self._pending_speech_count > 0:
+                    self._speech_frames.extend(self._pending_speech_frames)
+                    self._pending_speech_count = 0
+                    self._pending_speech_frames = []
+
                 self._silence_frame_count += 1
 
                 # 捕获后置真实尾帧（前 N 个静默帧拼入语音段作为上下文）
@@ -203,6 +236,8 @@ class TenVADSession:
         self._speech_frame_count = 0
         self._silence_frame_count = 0
         self._post_count = 0
+        self._pending_speech_count = 0
+        self._pending_speech_frames = []
 
 
 # ---- 动态阈值判定（独立函数，方便单元测试） ----

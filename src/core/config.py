@@ -75,6 +75,9 @@ class Settings:
     """短音频抑制门限（秒），不足则不转发。"""
     VAD_MAX_SPEECH: float = float(os.getenv("VAD_MAX_SPEECH", "30.0"))
     """长音频强制触发门限（秒），立即转发。"""
+    VAD_SPEECH_CONFIRM_FRAMES: int = int(os.getenv("VAD_SPEECH_CONFIRM_FRAMES", "2"))
+    """重置静默计数所需的连续语音帧数。静默期间偶发的不足此数的语音帧视为抖动噪音，
+    不中断静默计时，从而避免断句延迟过高。默认 2 帧 = 80ms@16kHz/hop640。"""
 
 
 # 全局单例
