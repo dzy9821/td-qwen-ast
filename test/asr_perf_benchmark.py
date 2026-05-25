@@ -9,6 +9,7 @@ import ssl
 import struct
 import time
 import wave
+from typing import Dict, List, Optional
 
 
 # ============================================================
@@ -161,11 +162,14 @@ class _SimpleWS:
         return frame + payload
 
 class SegmentMetrics:
-    def __init__(self, bg_ms, ed_ms, text, recv_time):
+    def __init__(self, bg_ms, ed_ms, text, recv_audio_clock_ms):
         self.bg_ms = bg_ms
         self.ed_ms = ed_ms
         self.text = text
-        self.recv_time = recv_time
+        # recv_audio_clock_ms: result received at what "audio clock" position (ms).
+        # i.e. (recv_monotonic - first_chunk_send_monotonic) * 1000
+        # This allows direct comparison with ed_ms to detect falling behind.
+        self.recv_audio_clock_ms = recv_audio_clock_ms
         self.asr_ms = 0.0
         self.total_ms = 0.0
         self.segment_e2e_ms = 0.0
@@ -309,7 +313,7 @@ async def _run_connection(conn_id, url, chunks, chunk_samples, args, start_delay
             # ---- Per-chunk send timestamps (client clock as authoritative time base) ----
             chunk_duration = chunk_samples / 16000.0
             chunk_ms = chunk_duration * 1000.0
-            send_times: list[float] = []  # send_times[i] = time.monotonic() when chunk i was sent
+            send_times = []  # type: List[float]
 
             # VAD post-padding frames (ASR_PAD_FRAMES * HOP_SIZE samples)
             PAD_SAMPLES = 5 * 640
@@ -426,28 +430,42 @@ def _extract_segment(resp, send_times, chunk_ms, pad_ms, metrics):
         send_t = send_times[0] if send_times else recv_time
         e2e_ms = (recv_time - send_t) * 1000.0 - speech_end_ms
 
-    seg = SegmentMetrics(bg_ms, ed_ms, text, recv_time)
+    # Convert recv_time to audio-clock ms (relative to first chunk send time)
+    # This allows comparison with ed_ms for bottleneck detection.
+    audio_clock_base = send_times[0] if send_times else recv_time
+    recv_audio_clock_ms = (recv_time - audio_clock_base) * 1000.0
+
+    seg = SegmentMetrics(bg_ms, ed_ms, text, recv_audio_clock_ms)
     seg.asr_ms = server_asr_ms
     seg.total_ms = server_total_ms
     seg.segment_e2e_ms = e2e_ms
     metrics.segments.append(seg)
 
 def _detect_bottlenecks(metrics):
+    """Detect bottlenecks: segment N result arrived after segment N+1 audio was fully sent.
+
+    Both recv_audio_clock_ms and ed_ms are in the same coordinate system:
+    milliseconds relative to the start of audio sending. If seg_N's result
+    arrives at audio-clock time T, and T > seg_N+1.ed_ms, it means the system
+    is falling behind — by the time we got seg_N's result, all audio for
+    seg_N+1 had already been transmitted.
+    """
     metrics.segments.sort(key=lambda x: x.bg_ms)
     for i in range(len(metrics.segments) - 1):
         seg_n = metrics.segments[i]
         seg_n1 = metrics.segments[i + 1]
-        
-        recv_wall_ms = seg_n.recv_time
+
+        recv_clock_ms = seg_n.recv_audio_clock_ms
         next_seg_ed_ms = seg_n1.ed_ms
-        
-        if recv_wall_ms > next_seg_ed_ms:
+
+        if recv_clock_ms > next_seg_ed_ms:
+            lag_ms = recv_clock_ms - next_seg_ed_ms
             metrics.bottleneck_count += 1
             metrics.bottleneck_details.append({
                 "seg_idx": i,
-                "recv_time": recv_wall_ms,
-                "next_ed": next_seg_ed_ms,
-                "diff": recv_wall_ms - next_seg_ed_ms
+                "recv_clock_ms": recv_clock_ms,
+                "next_ed_ms": next_seg_ed_ms,
+                "lag_ms": lag_ms,
             })
 
 async def run_level(level, url, chunks, chunk_samples, args):
@@ -508,7 +526,7 @@ def _pad(s: str, width: int, align: str = "<") -> str:
     return s + " " * pad_n
 
 
-def _table(headers: list[str], rows: list[list[str]], col_aligns: list[str] | None = None) -> list[str]:
+def _table(headers: List[str], rows: List[List[str]], col_aligns: Optional[List[str]] = None) -> List[str]:
     """Build a formatted ASCII table with box-drawing borders.
 
     col_aligns: list of '<' (left), '>' (right), '^' (center) per column.
@@ -615,111 +633,86 @@ def generate_report(results, args, audio_duration_ms):
     lines.extend(_table(headers, rows, col_aligns))
     lines.append("")
 
-    # Section 2: Latency breakdown (E2E vs server total_ms)
+    # Section 2: Per-segment E2E vs total_ms breakdown per concurrency level
     lines.append("─" * W)
-    lines.append("  [二] 延迟分解对比 (E2E vs 服务端处理耗时)")
+    lines.append("  [二] 分段延迟对比 (每段语音 E2E vs 服务端耗时)")
     lines.append("─" * W)
     lines.append("")
-    lines.append("  E2E = 语音结束帧发出 → 收到结果（含 VAD 断句等待 + ASR + ITN + 排序等待）")
-    lines.append("  服务端 total_ms = ASR + ITN 处理耗时（不含 VAD 等待）")
-    lines.append("  差值 ≈ VAD 静默断句等待 + 结果排序等待")
+    lines.append("  E2E     = 语音结束帧发出 → 收到结果 (含VAD断句等待+ASR+ITN+排序)")
+    lines.append("  total_ms = 服务端 ASR+ITN 处理耗时 (不含VAD等待)")
+    lines.append("  差值    ≈ VAD 静默断句等待 + 结果排序等待")
     lines.append("")
 
-    has_timing = False
+    has_any_segments = False
     for res in results:
-        all_e2e = []
-        all_total = []
-        all_asr = []
-        for c in res.connections:
-            for s in c.segments:
-                all_e2e.append(s.segment_e2e_ms)
-                if s.total_ms > 0:
-                    all_total.append(s.total_ms)
-                    has_timing = True
-                if s.asr_ms > 0:
-                    all_asr.append(s.asr_ms)
-
-        if all_e2e:
-            headers2 = ["指标", "avg", "P50", "P90", "P99", "max"]
-            aligns2 = ["<", ">", ">", ">", ">", ">"]
-            rows2 = []
-            rows2.append([
-                f"E2E (并发{res.level})",
-                f"{sum(all_e2e)/len(all_e2e):.0f}ms",
-                f"{percentile(all_e2e, 50):.0f}ms",
-                f"{percentile(all_e2e, 90):.0f}ms",
-                f"{percentile(all_e2e, 99):.0f}ms",
-                f"{max(all_e2e):.0f}ms",
-            ])
-            if all_total:
-                rows2.append([
-                    f"服务端total (并发{res.level})",
-                    f"{sum(all_total)/len(all_total):.0f}ms",
-                    f"{percentile(all_total, 50):.0f}ms",
-                    f"{percentile(all_total, 90):.0f}ms",
-                    f"{percentile(all_total, 99):.0f}ms",
-                    f"{max(all_total):.0f}ms",
-                ])
-            if all_asr:
-                rows2.append([
-                    f"ASR推理 (并发{res.level})",
-                    f"{sum(all_asr)/len(all_asr):.0f}ms",
-                    f"{percentile(all_asr, 50):.0f}ms",
-                    f"{percentile(all_asr, 90):.0f}ms",
-                    f"{percentile(all_asr, 99):.0f}ms",
-                    f"{max(all_asr):.0f}ms",
-                ])
-            lines.extend(_table(headers2, rows2, aligns2))
-            lines.append("")
-
-    if not has_timing:
-        lines.append("  (服务端未返回 timing 信息，无法分解)")
-        lines.append("")
-
-    # Section 3: Per-segment comparison across concurrency levels
-    lines.append("─" * W)
-    lines.append("  [三] 分段延迟对比 (行=段序号, 列=并发级别, 值=平均E2E ms)")
-    lines.append("─" * W)
-    lines.append("")
-
-    has_segments = False
-    max_segs = 0
-    level_seg_data: dict[int, dict[int, list[float]]] = {}
-    for res in results:
-        seg_map: dict[int, list[float]] = {}
+        # Collect per-segment-index data across all connections in this level
+        seg_e2e = {}   # type: Dict[int, List[float]]
+        seg_total = {}  # type: Dict[int, List[float]]
+        seg_asr = {}   # type: Dict[int, List[float]]
+        max_seg_idx = -1
         for c in res.connections:
             for idx, s in enumerate(c.segments):
-                seg_map.setdefault(idx, []).append(s.segment_e2e_ms)
-        if seg_map:
-            has_segments = True
-            max_segs = max(max_segs, max(seg_map.keys()))
-        level_seg_data[res.level] = seg_map
+                seg_e2e.setdefault(idx, []).append(s.segment_e2e_ms)
+                if s.total_ms > 0:
+                    seg_total.setdefault(idx, []).append(s.total_ms)
+                if s.asr_ms > 0:
+                    seg_asr.setdefault(idx, []).append(s.asr_ms)
+                max_seg_idx = max(max_seg_idx, idx)
 
-    levels_sorted = sorted(level_seg_data.keys())
+        if max_seg_idx < 0:
+            continue
+        has_any_segments = True
 
-    if has_segments:
-        seg_headers = ["段#"] + [f"并发{lv}" for lv in levels_sorted]
-        seg_aligns = [">"] + [">"] * len(levels_sorted)
+        lines.append(f"  ▸ 并发级别 {res.level} ({sum(1 for c in res.connections if c.success)}/{len(res.connections)} 成功)")
+        lines.append("")
+
+        seg_headers = ["段#", "E2E avg(ms)", "total avg(ms)", "差值(ms)", "ASR avg(ms)"]
+        seg_aligns = [">", ">", ">", ">", ">"]
         seg_rows = []
-        for seg_idx in range(max_segs + 1):
-            row = [str(seg_idx)]
-            for lv in levels_sorted:
-                values = level_seg_data.get(lv, {}).get(seg_idx, [])
-                if values:
-                    avg = sum(values) / len(values)
-                    row.append(f"{avg:.0f}")
-                else:
-                    row.append("-")
-            seg_rows.append(row)
+        for seg_idx in range(max_seg_idx + 1):
+            e2e_vals = seg_e2e.get(seg_idx, [])
+            total_vals = seg_total.get(seg_idx, [])
+            asr_vals = seg_asr.get(seg_idx, [])
+
+            e2e_avg = sum(e2e_vals) / len(e2e_vals) if e2e_vals else 0
+            total_avg = sum(total_vals) / len(total_vals) if total_vals else 0
+            asr_avg = sum(asr_vals) / len(asr_vals) if asr_vals else 0
+            diff = e2e_avg - total_avg if total_vals else 0
+
+            seg_rows.append([
+                f"第{seg_idx}段",
+                f"{e2e_avg:.0f}" if e2e_vals else "-",
+                f"{total_avg:.0f}" if total_vals else "-",
+                f"{diff:.0f}" if total_vals else "-",
+                f"{asr_avg:.0f}" if asr_vals else "-",
+            ])
+
+        # Summary row
+        all_e2e = [v for vals in seg_e2e.values() for v in vals]
+        all_total = [v for vals in seg_total.values() for v in vals]
+        all_asr = [v for vals in seg_asr.values() for v in vals]
+        total_e2e_avg = sum(all_e2e) / len(all_e2e) if all_e2e else 0
+        total_total_avg = sum(all_total) / len(all_total) if all_total else 0
+        total_asr_avg = sum(all_asr) / len(all_asr) if all_asr else 0
+        total_diff = total_e2e_avg - total_total_avg if all_total else 0
+        seg_rows.append([
+            "整体avg",
+            f"{total_e2e_avg:.0f}" if all_e2e else "-",
+            f"{total_total_avg:.0f}" if all_total else "-",
+            f"{total_diff:.0f}" if all_total else "-",
+            f"{total_asr_avg:.0f}" if all_asr else "-",
+        ])
+
         lines.extend(_table(seg_headers, seg_rows, seg_aligns))
-    else:
+        lines.append("")
+
+    if not has_any_segments:
         lines.append("  无有效分段数据")
+        lines.append("")
 
-    lines.append("")
-
-    # Section 4: Detailed per-level report
+    # Section 3: Detailed per-level report
     lines.append("─" * W)
-    lines.append("  [四] 各并发级别详细报告")
+    lines.append("  [三] 各并发级别详细报告")
     lines.append("─" * W)
 
     for res in results:
@@ -768,7 +761,10 @@ def generate_report(results, args, audio_duration_ms):
                 if c.bottleneck_count > 0:
                     lines.append(f"      连接 {c.conn_id}: {c.bottleneck_count} 次")
                     for d in c.bottleneck_details[:3]:
-                        lines.append(f"        └ 第{d['seg_idx']}段结果延迟，超出下一段结束时间 {d['diff']:.0f}ms")
+                        lines.append(
+                            f"        └ 段{d['seg_idx']}结果到达时(audio clock {d['recv_clock_ms']:.0f}ms)"
+                            f" 已超过下一段结束位置({d['next_ed_ms']:.0f}ms)，滞后 {d['lag_ms']:.0f}ms"
+                        )
                     if len(c.bottleneck_details) > 3:
                         lines.append(f"        └ ... 还有 {len(c.bottleneck_details)-3} 条")
         lines.append("")
