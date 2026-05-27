@@ -46,3 +46,7 @@ COPY connections.py /vllm-workspace/vllm/vllm/connections.py
 
 # 翻译代理
 COPY translation_proxy.py /workspace/translation_proxy.py
+
+# 语言模型健康检查脚本
+COPY healthcheck-vl-7b.sh /healthcheck-vl-7b.sh
+RUN chmod +x /healthcheck-vl-7b.sh
